@@ -1,0 +1,8 @@
+torch
+torchvision
+numpy
+Pillow
+sam3 
+requests
+runpod
+psutil  
