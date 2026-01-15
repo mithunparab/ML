@@ -28,10 +28,13 @@ def initialize_model():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
     
+    print(f"Loading SAM3 Model to {DEVICE}...")
     MODEL = build_sam3_image_model().to(DEVICE)
     PROCESSOR = Sam3Processor(MODEL, confidence_threshold=0.3)
+    print("Model loaded.")
 
 def from_sam(sam_result: dict) -> tuple:
+    """Extracts boxes, scores, and masks from SAM result tensors."""
     xyxy = sam_result["boxes"].to(torch.float32).cpu().numpy()
     confidence = sam_result["scores"].to(torch.float32).cpu().numpy()
 
@@ -40,21 +43,21 @@ def from_sam(sam_result: dict) -> tuple:
 
     return xyxy, confidence, mask
 
-def process_image(image_data: str, prompt: str, output_path: str, is_base64: bool = False):
+def process_image(data_source: str, prompt: str = None, box_prompts: list = None, box_labels: list = None, output_path: str = "", is_base64: bool = False):
     initialize_model()
 
     if is_base64:
         print("Decoding Base64 image data...")
         try:
-            image_bytes = base64.b64decode(image_data)
+            image_bytes = base64.b64decode(data_source)
             image = Image.open(BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
             print(f"Error decoding Base64 image: {e}")
             return None
     else:
-        print(f"Downloading image from URL: {image_data}")
+        print(f"Downloading image from URL: {data_source}")
         try:
-            response = requests.get(image_data)
+            response = requests.get(data_source)
             image = Image.open(BytesIO(response.content)).convert("RGB")
         except Exception as e:
             print(f"Error downloading image from URL: {e}")
@@ -63,15 +66,34 @@ def process_image(image_data: str, prompt: str, output_path: str, is_base64: boo
     image_np = np.array(image)
 
     inference_state = PROCESSOR.set_image(image)
-    inference_state = PROCESSOR.set_text_prompt(state=inference_state, prompt=prompt)
+
+    if prompt:
+        print(f"Applying text prompt: {prompt}")
+        inference_state = PROCESSOR.set_text_prompt(state=inference_state, prompt=prompt)
     
+    if box_prompts:
+        print(f"Applying {len(box_prompts)} box prompts.")
+        boxes_np = np.array(box_prompts)
+        
+        if box_labels:
+            labels_np = np.array(box_labels)
+        else:
+            labels_np = np.ones(len(box_prompts))
+
+
+        inference_state = PROCESSOR.set_box_prompt(
+            state=inference_state, 
+            box=boxes_np, 
+            label=labels_np
+        )
+
     xyxy, confidence, masks = from_sam(sam_result=inference_state)
 
     confidence_mask = confidence > CONFIDENCE_THRESHOLD
     xyxy = xyxy[confidence_mask]
     masks = masks[confidence_mask]
 
-    print(f"Detected {len(masks)} objects with confidence > {CONFIDENCE_THRESHOLD} for prompt: {prompt}")
+    print(f"Detected {len(masks)} objects with confidence > {CONFIDENCE_THRESHOLD}")
 
     if len(masks) > 0:
         combined_mask = np.logical_or.reduce(masks)
@@ -91,18 +113,22 @@ def process_image(image_data: str, prompt: str, output_path: str, is_base64: boo
         cropped_original_np = image_np[y_min:y_max, x_min:x_max]
         
         alpha_channel = (cropped_mask * 255).astype(np.uint8)
+        
+        if alpha_channel.shape[:2] != cropped_original_np.shape[:2]:
+            print("Resizing alpha channel to match crop dimensions...")
+            alpha_pil = Image.fromarray(alpha_channel).resize((cropped_original_np.shape[1], cropped_original_np.shape[0]))
+            alpha_channel = np.array(alpha_pil)
+
         rgba_image_np = np.dstack((cropped_original_np, alpha_channel))
         
         transparent_image = Image.fromarray(rgba_image_np, 'RGBA')
 
-        # Save to buffer and encode to Base64 for API return
         buffer = BytesIO()
         transparent_image.save(buffer, format="PNG")
         output_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
         
-        # Save to disk for local runpod setup compatibility
         transparent_image.save(output_path)
-        print(f"Saved local file to {output_path}")
+        print(f"Saved result to {output_path}")
 
         return output_base64
 
