@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     wget \
     libgl1 \
+    curl \
+    ca-certificates \
     && add-apt-repository ppa:deadsnakes/ppa -y \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -30,6 +32,9 @@ RUN sed -i '/torch/d' requirements.txt
 RUN sed -i '/torchvision/d' requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN mkdir -p /usr/local/lib/python3.12/dist-packages/assets/ \
+    && wget -O /usr/local/lib/python3.12/dist-packages/assets/bpe_simple_vocab_16e6.txt.gz \
+    https://github.com/openai/CLIP/raw/main/clip/bpe_simple_vocab_16e6.txt.gz
 
 COPY run_sam.py /app/
 COPY handler.py /app/
