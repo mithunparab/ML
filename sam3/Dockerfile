@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 RUN sed -i '/torch/d' requirements.txt
 RUN sed -i '/torchvision/d' requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install decord
 
 RUN mkdir -p /usr/local/lib/python3.12/dist-packages/assets/ \
     && wget -O /usr/local/lib/python3.12/dist-packages/assets/bpe_simple_vocab_16e6.txt.gz \
