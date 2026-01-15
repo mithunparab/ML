@@ -30,16 +30,8 @@ def initialize_model():
     PROCESSOR = Sam3Processor(MODEL, confidence_threshold=0.3)
     print("Model loaded.")
 
-def from_sam(sam_result: dict) -> tuple:
-    xyxy = sam_result["boxes"].to(torch.float32).cpu().numpy()
-    confidence = sam_result["scores"].to(torch.float32).cpu().numpy()
-    mask = sam_result["masks"].to(torch.bool)
-    mask = mask.reshape(mask.shape[0], mask.shape[2], mask.shape[3]).cpu().numpy()
-    return xyxy, confidence, mask
-
 def process_image(data_source: str, prompt: str = None, box_prompts: list = None, box_labels: list = None, output_path: str = "", is_base64: bool = False):
     initialize_model()
-
     if is_base64:
         try:
             image_bytes = base64.b64decode(data_source)
@@ -56,25 +48,75 @@ def process_image(data_source: str, prompt: str = None, box_prompts: list = None
             return None, None
 
     image_np = np.array(image)
+    masks = []
+    xyxy = []
 
-    inference_state = PROCESSOR.set_image(image)
+    if box_prompts and len(box_prompts) > 0:
+        print(f"Processing with {len(box_prompts)} input boxes...")
+        
+        formatted_boxes = [box_prompts] 
+        
+        if box_labels:
+             formatted_labels = [box_labels]
+        else:
+             formatted_labels = [[1] * len(box_prompts)]
 
-    if prompt:
+        inputs = PROCESSOR(
+            images=image,
+            input_boxes=formatted_boxes,
+            input_boxes_labels=formatted_labels,
+            return_tensors="pt"
+        ).to(DEVICE)
+
+        with torch.no_grad():
+            outputs = MODEL(**inputs)
+
+        results = PROCESSOR.post_process_instance_segmentation(
+            outputs,
+            threshold=CONFIDENCE_THRESHOLD,
+            mask_threshold=0.5, 
+            target_sizes=inputs.get("original_sizes").tolist()
+        )[0] 
+
+
+        if "masks" in results:
+            masks_tensor = results["masks"]
+            if isinstance(masks_tensor, torch.Tensor):
+                 masks = masks_tensor.cpu().numpy()
+            else:
+                 masks = masks_tensor
+            
+            # Ensure boolean
+            masks = masks > 0.5 
+
+        if "boxes" in results:
+            xyxy = results["boxes"].cpu().numpy() if isinstance(results["boxes"], torch.Tensor) else results["boxes"]
+
+    elif prompt:
+        print(f"Processing with text prompt: {prompt}")
+        inference_state = PROCESSOR.set_image(image)
         inference_state = PROCESSOR.set_text_prompt(state=inference_state, prompt=prompt)
-    
-    if box_prompts:
-        boxes_np = np.array(box_prompts)
-        labels_np = np.array(box_labels) if box_labels else np.ones(len(box_prompts))
-        inference_state = PROCESSOR.set_box_prompt(state=inference_state, box=boxes_np, label=labels_np)
+        
+        xyxy_res = inference_state["boxes"].to(torch.float32).cpu().numpy()
+        confidence_res = inference_state["scores"].to(torch.float32).cpu().numpy()
+        masks_res = inference_state["masks"].to(torch.bool)
+        masks_res = masks_res.reshape(masks_res.shape[0], masks_res.shape[2], masks_res.shape[3]).cpu().numpy()
 
-    xyxy, confidence, masks = from_sam(sam_result=inference_state)
+        conf_mask = confidence_res > CONFIDENCE_THRESHOLD
+        xyxy = xyxy_res[conf_mask]
+        masks = masks_res[conf_mask]
 
-    confidence_mask = confidence > CONFIDENCE_THRESHOLD
-    xyxy = xyxy[confidence_mask]
-    masks = masks[confidence_mask]
+    else:
+        print("No prompts provided.")
+        return None, None
+
+    print(f"Detected {len(masks)} mask objects.")
 
     if len(masks) > 0:
-        combined_mask = np.logical_or.reduce(masks) 
+        if masks.ndim == 3:
+             combined_mask = np.logical_or.reduce(masks)
+        else:
+             combined_mask = masks 
 
         full_mask_uint8 = (combined_mask * 255).astype(np.uint8)
         full_mask_image = Image.fromarray(full_mask_uint8, 'L')
@@ -83,11 +125,17 @@ def process_image(data_source: str, prompt: str = None, box_prompts: list = None
         full_mask_image.save(buffer_mask, format="PNG")
         mask_base64 = base64.b64encode(buffer_mask.getvalue()).decode('utf-8')
 
-        x_min = int(np.min(xyxy[:, 0]))
-        y_min = int(np.min(xyxy[:, 1]))
-        x_max = int(np.max(xyxy[:, 2]))
-        y_max = int(np.max(xyxy[:, 3]))
-        
+        if len(xyxy) > 0:
+            x_min = int(np.min(xyxy[:, 0]))
+            y_min = int(np.min(xyxy[:, 1]))
+            x_max = int(np.max(xyxy[:, 2]))
+            y_max = int(np.max(xyxy[:, 3]))
+        else:
+            rows = np.any(combined_mask, axis=1)
+            cols = np.any(combined_mask, axis=0)
+            y_min, y_max = np.where(rows)[0][[0, -1]]
+            x_min, x_max = np.where(cols)[0][[0, -1]]
+
         H, W, _ = image_np.shape
         x_min, y_min = max(0, x_min), max(0, y_min)
         x_max, y_max = min(W, x_max), min(H, y_max)
