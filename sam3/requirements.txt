@@ -4,5 +4,6 @@ numpy
 Pillow
 sam3 
 requests
+scipy
 runpod
 psutil  

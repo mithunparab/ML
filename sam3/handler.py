@@ -17,7 +17,8 @@ def handler(job):
     text_prompt = job_input.get('prompt')
     input_boxes = job_input.get('input_boxes')
     input_labels = job_input.get('input_labels')
-    
+    confidence_threshold = job_input.get('confidence_threshold')
+
     data_source = image_data if image_data else image_url
     is_base64 = True if image_data else False
 
@@ -28,12 +29,13 @@ def handler(job):
     
     try:
         result_base64, mask_base64 = run_sam.process_image(
-            data_source=data_source, 
+            data_source=data_source,
             prompt=text_prompt,
             box_prompts=input_boxes,
             box_labels=input_labels,
-            output_path="", 
-            is_base64=is_base64
+            output_path="",
+            is_base64=is_base64,
+            confidence_threshold=confidence_threshold
         )
     except Exception as e:
         return {"error": str(e)}

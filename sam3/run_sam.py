@@ -5,6 +5,7 @@ from PIL import Image
 import requests
 from io import BytesIO
 import base64
+from scipy import ndimage
 
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
@@ -12,7 +13,7 @@ from sam3.model.sam3_image_processor import Sam3Processor
 MODEL = None
 PROCESSOR = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CONFIDENCE_THRESHOLD = 0.45
+CONFIDENCE_THRESHOLD = 0.20
 
 def initialize_model():
     global MODEL, PROCESSOR
@@ -29,7 +30,7 @@ def initialize_model():
     PROCESSOR = Sam3Processor(MODEL, confidence_threshold=0.3)
     print("Model loaded.")
 
-def process_image(data_source: str, prompt: str = None, box_prompts: list = None, box_labels: list = None, output_path: str = "", is_base64: bool = False):
+def process_image(data_source: str, prompt: str = None, box_prompts: list = None, box_labels: list = None, output_path: str = "", is_base64: bool = False, confidence_threshold: float = None):
     initialize_model()
 
     if is_base64:
@@ -51,13 +52,25 @@ def process_image(data_source: str, prompt: str = None, box_prompts: list = None
     orig_w, orig_h = image.size
 
     
+    all_masks = []
+    all_boxes = []
+    all_scores = []
+
     if prompt:
-        print(f"Applying text prompt: {prompt}")
-        inference_state = PROCESSOR.set_text_prompt(state=inference_state, prompt=prompt)
+        prompts = [p.strip() for p in prompt.split(',') if p.strip()]
+        for p in prompts:
+            print(f"Applying text prompt: {p}")
+            prompt_state = PROCESSOR.set_text_prompt(state={**inference_state}, prompt=p)
+            if "masks" in prompt_state and prompt_state["masks"] is not None:
+                all_masks.append(prompt_state["masks"])
+                if "boxes" in prompt_state:
+                    all_boxes.append(prompt_state["boxes"])
+                if "scores" in prompt_state:
+                    all_scores.append(prompt_state["scores"])
 
     if box_prompts and len(box_prompts) > 0:
         print(f"Applying {len(box_prompts)} box prompts...")
-        
+
         if not box_labels:
             box_labels = [1] * len(box_prompts)
 
@@ -74,7 +87,7 @@ def process_image(data_source: str, prompt: str = None, box_prompts: list = None
 
             w_px = x2 - x1
             h_px = y2 - y1
-            
+
             cx_px = x1 + (w_px / 2.0)
             cy_px = y1 + (h_px / 2.0)
 
@@ -82,17 +95,42 @@ def process_image(data_source: str, prompt: str = None, box_prompts: list = None
             cy_norm = cy_px / orig_h
             w_norm = w_px / orig_w
             h_norm = h_px / orig_h
-            
+
             geometric_box = [cx_norm, cy_norm, w_norm, h_norm]
             print(f"Adding Geometric Prompt: {geometric_box}, Positive: {is_positive}")
 
-            inference_state = PROCESSOR.add_geometric_prompt(
+            box_state = PROCESSOR.add_geometric_prompt(
                 box=geometric_box,
                 label=is_positive,
-                state=inference_state
+                state={**inference_state}
             )
 
-    if "masks" not in inference_state or inference_state["masks"] is None:
+            if "masks" in box_state and box_state["masks"] is not None:
+                if is_positive:
+                    all_masks.append(box_state["masks"])
+                    if "boxes" in box_state:
+                        all_boxes.append(box_state["boxes"])
+                    if "scores" in box_state:
+                        all_scores.append(box_state["scores"])
+                else:
+                    # Negative boxes: store to subtract later
+                    all_masks.append(box_state["masks"])
+                    all_boxes.append(box_state.get("boxes", torch.tensor([])))
+                    all_scores.append(box_state.get("scores", torch.tensor([])))
+
+            # Reset for next box so prompts don't stack
+            inference_state = PROCESSOR.reset_all_prompts(state=inference_state)
+            inference_state = PROCESSOR.set_image(image, state=inference_state)
+
+    if not all_masks:
+        return None, None
+
+    # Concatenate all results
+    inference_state["masks"] = torch.cat(all_masks, dim=0) if len(all_masks) > 1 else all_masks[0]
+    inference_state["boxes"] = torch.cat(all_boxes, dim=0) if all_boxes else torch.tensor([])
+    inference_state["scores"] = torch.cat(all_scores, dim=0) if all_scores else torch.tensor([])
+
+    if inference_state["masks"] is None:
         return None, None
 
     def to_numpy(x):
@@ -110,7 +148,9 @@ def process_image(data_source: str, prompt: str = None, box_prompts: list = None
             masks_res = masks_res.reshape(masks_res.shape[0] * masks_res.shape[1], masks_res.shape[2], masks_res.shape[3])
         masks_res = masks_res.cpu().numpy()
 
-    mask_filter = scores > CONFIDENCE_THRESHOLD
+    threshold = confidence_threshold if confidence_threshold is not None else CONFIDENCE_THRESHOLD
+    print(f"All scores: {scores.tolist()}, threshold: {threshold}")
+    mask_filter = scores > threshold
     masks = masks_res[mask_filter]
     xyxy = xyxy_res[mask_filter]
 
@@ -121,6 +161,11 @@ def process_image(data_source: str, prompt: str = None, box_prompts: list = None
              combined_mask = np.logical_or.reduce(masks)
         else:
              combined_mask = masks
+
+        # Fill interior holes: morphological closing + binary fill
+        struct = ndimage.generate_binary_structure(2, 2)
+        combined_mask = ndimage.binary_closing(combined_mask, structure=struct, iterations=5)
+        combined_mask = ndimage.binary_fill_holes(combined_mask)
 
         image_np = np.array(image)
 
